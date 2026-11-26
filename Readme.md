@@ -7,6 +7,7 @@ A beautiful, real-time CLI tool for monitoring network latency over configurable
 ## Features
 
 - **📊 Sliding Window Statistics** — Track metrics across multiple configurable time periods (10s, 1m, 5m, 1h, etc.)
+- **⏱️ Lifetime Analytics** — Cumulative session metrics (Sent, Rcvd, Loss, Min/Max/Avg RTT, Jitter) right in the table
 - **🎨 Live Color-Coded Display** — Green for healthy, yellow for moderate, red for critical latency/loss
 - **⚡ Real-Time Updates** — In-place refresh shows evolving stats as old pings age out of each window
 - **🔒 No Root Required** — Uses unprivileged ICMP sockets (works on most modern Linux systems)
@@ -99,21 +100,22 @@ Time windows can be specified in seconds (`s`), minutes (`m`), or hours (`h`):
 ## Output Format
 
 ```
-ltping  google.com  (142.250.80.46)  seq=42  last=15.3 ms  lifetime 42/42 (100.0%)
+ltping  google.com  (142.250.80.46)  seq=42  last=15.3 ms
 ────────────────────────────────────────────────────────────────────────
- Window   Sent   Rcvd    Loss      Min      Max      Avg   Jitter
+  Window   Sent   Rcvd    Loss      Min      Max      Avg   Jitter
 ────────────────────────────────────────────────────────────────────────
-    10s     10     10    0.0%    12 ms    18 ms    15 ms    2.1 ms
-    30s     30     30    0.0%    12 ms    20 ms    15 ms    2.3 ms
-    60s     60     59    1.7%    12 ms    25 ms    16 ms    3.1 ms
+     10s     10     10    0.0%    12 ms    18 ms    15 ms    2.1 ms
+     30s     30     30    0.0%    12 ms    20 ms    15 ms    2.3 ms
+     60s     60     59    1.7%    12 ms    25 ms    16 ms    3.1 ms
+Lifetime     60     59    1.7%    12 ms    25 ms    16 ms    3.1 ms
 ────────────────────────────────────────────────────────────────────────
 Press Ctrl+C to stop.
 ```
 
 ### Metrics Explained
 
-- **Window** — Time period for the rolling statistics
-- **Sent** — Total pings sent in this window
+- **Window** — Time period for rolling statistics (e.g. `10s`, `30s`, `1m`) or **`Lifetime`** for full session metrics
+- **Sent** — Total pings sent in this window (or across the entire session for Lifetime)
 - **Rcvd** — Pings that received a reply
 - **Loss** — Packet loss percentage (color-coded: green = 0%, yellow < 10%, red ≥ 10%)
 - **Min/Max/Avg** — Round-trip time statistics in milliseconds
@@ -175,6 +177,8 @@ python3 ltping.py cloudflare.com -w 30s 2m 5m
 ## How It Works
 
 **Sliding Windows:** Each time window maintains a queue of recent ping results. As new pings arrive, old ones beyond the window duration are automatically dropped. This gives you real-time insight into recent network behavior.
+
+**Lifetime Metrics:** A session-wide tracker records all pings, displaying cumulative sent/received counts, loss percentage, min/max/average latency, and jitter directly in the bottom row of the table.
 
 **Unprivileged ICMP:** Uses `SOCK_DGRAM` with `IPPROTO_ICMP` — the Linux kernel's ping socket API. No raw sockets required, so no root privileges needed on most systems.
 

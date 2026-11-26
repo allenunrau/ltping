@@ -215,13 +215,43 @@ def _rtt_color(val: float | None) -> str:
     return C.BRED
 
 
+def _format_row(label: str, s: dict) -> str:
+    # Loss colour
+    loss_c  = _loss_color(s['loss_pct'])
+    loss_s  = f"{s['loss_pct']:.1f}%"
+
+    # RTT colours
+    min_c   = _rtt_color(s['min_rtt'])
+    max_c   = _rtt_color(s['max_rtt'])
+    avg_c   = _rtt_color(s['avg_rtt'])
+
+    # Jitter colour (green if low relative to avg)
+    jit_c = C.BGREEN
+    if s['jitter'] is not None and s['avg_rtt'] is not None and s['avg_rtt'] > 0:
+        ratio = s['jitter'] / s['avg_rtt']
+        if ratio > 0.5:  jit_c = C.BRED
+        elif ratio > 0.2: jit_c = C.BYELLOW
+
+    return (
+        f"{C.BOLD}{C.BYELLOW}{label:>8s}{C.RESET}"
+        f"  {C.BWHITE}{s['total']:>5d}{C.RESET}"
+        f"  {C.BWHITE}{s['received']:>5d}{C.RESET}"
+        f"  {loss_c}{loss_s:>6s}{C.RESET}"
+        f"  {min_c}{_fmt_ms(s['min_rtt']) + ' ms':>7s}{C.RESET}"
+        f"  {max_c}{_fmt_ms(s['max_rtt']) + ' ms':>7s}{C.RESET}"
+        f"  {avg_c}{_fmt_ms(s['avg_rtt']) + ' ms':>7s}{C.RESET}"
+        f"  {jit_c}{_fmt_ms(s['jitter']) + ' ms':>7s}{C.RESET}"
+    )
+
+
 def render_display(windows: list[tuple[int, StatsWindow]],
                    target: str,
                    resolved_ip: str,
                    seq: int,
                    last_rtt: float | None,
                    total_sent: int,
-                   total_rcvd: int) -> str:
+                   total_rcvd: int,
+                   lifetime_window: StatsWindow | None = None) -> str:
     """Build the full display string to be written to the terminal."""
     now = time.monotonic()
     lines = []
@@ -232,10 +262,7 @@ def render_display(windows: list[tuple[int, StatsWindow]],
                  f"{C.DIM}{C.WHITE}{target}{C.RESET}"
                  f"  ({C.DIM}{C.CYAN}{resolved_ip}{C.RESET}{C.DIM}){C.RESET}"
                  f"  seq={C.BOLD}{seq}{C.RESET}"
-                 f"  last={rtt_str}"
-                 f"  lifetime {C.BGREEN}{total_rcvd}{C.RESET}/{total_sent} "
-                 f"({_loss_color(100-100*total_rcvd/total_sent if total_sent else 100)}"
-                 f"{100*total_rcvd/total_sent if total_sent else 0:.1f}%{C.RESET})")
+                 f"  last={rtt_str}")
     lines.append(header)
 
     # ── Separator ──
@@ -243,7 +270,7 @@ def render_display(windows: list[tuple[int, StatsWindow]],
 
     # ── Column header ──
     lines.append(
-        f"{C.BOLD}{C.BYELLOW}{'Window':>7s}{C.RESET}"
+        f"{C.BOLD}{C.BYELLOW}{'Window':>8s}{C.RESET}"
         f"  {C.BOLD}{C.BWHITE}{'Sent':>5s}{C.RESET}"
         f"  {C.BOLD}{C.BWHITE}{'Rcvd':>5s}{C.RESET}"
         f"  {C.BOLD}{C.BWHITE}{'Loss':>6s}{C.RESET}"
@@ -266,33 +293,17 @@ def render_display(windows: list[tuple[int, StatsWindow]],
         else:
             label = f"{duration // 3600}h"
 
-        # Loss colour
-        loss_c  = _loss_color(s['loss_pct'])
-        loss_s  = f"{s['loss_pct']:.1f}%"
+        lines.append(_format_row(label, s))
 
-        # RTT colours
-        min_c   = _rtt_color(s['min_rtt'])
-        max_c   = _rtt_color(s['max_rtt'])
-        avg_c   = _rtt_color(s['avg_rtt'])
-
-        # Jitter colour (green if low relative to avg)
-        jit_c = C.BGREEN
-        if s['jitter'] is not None and s['avg_rtt'] is not None and s['avg_rtt'] > 0:
-            ratio = s['jitter'] / s['avg_rtt']
-            if ratio > 0.5:  jit_c = C.BRED
-            elif ratio > 0.2: jit_c = C.BYELLOW
-
-        line = (
-            f"{C.BOLD}{C.BYELLOW}{label:>7s}{C.RESET}"
-            f"  {C.BWHITE}{s['total']:>5d}{C.RESET}"
-            f"  {C.BWHITE}{s['received']:>5d}{C.RESET}"
-            f"  {loss_c}{loss_s:>6s}{C.RESET}"
-            f"  {min_c}{_fmt_ms(s['min_rtt']) + ' ms':>7s}{C.RESET}"
-            f"  {max_c}{_fmt_ms(s['max_rtt']) + ' ms':>7s}{C.RESET}"
-            f"  {avg_c}{_fmt_ms(s['avg_rtt']) + ' ms':>7s}{C.RESET}"
-            f"  {jit_c}{_fmt_ms(s['jitter']) + ' ms':>7s}{C.RESET}"
-        )
-        lines.append(line)
+    # ── Lifetime row ──
+    if lifetime_window is not None:
+        lines.append(_format_row("Lifetime", lifetime_window.stats(now)))
+    else:
+        loss_pct = 100.0 * (total_sent - total_rcvd) / total_sent if total_sent else 100.0
+        lines.append(_format_row("Lifetime", dict(
+            total=total_sent, received=total_rcvd, loss_pct=loss_pct,
+            min_rtt=None, max_rtt=None, avg_rtt=None, jitter=None
+        )))
 
     lines.append(f"{C.DIM}{C.CYAN}{'─' * 72}{C.RESET}")
     lines.append(f"{C.DIM}{C.WHITE}Press Ctrl+C to stop.{C.RESET}")
@@ -373,6 +384,7 @@ Examples:
 
     # Build StatsWindow objects
     windows: list[tuple[int, StatsWindow]] = [(s, StatsWindow(s)) for s in window_secs]
+    lifetime_window = StatsWindow(float('inf'))
 
     # Graceful shutdown flag
     running = True
@@ -395,7 +407,7 @@ Examples:
     num_lines   = 0  # lines written last frame (for cursor-up erasure)
 
     # Print initial frame immediately
-    output = render_display(windows, target_label, resolved_ip, seq, None, 0, 0)
+    output = render_display(windows, target_label, resolved_ip, seq, None, 0, 0, lifetime_window)
     num_lines = output.count("\n") + 1
     sys.stdout.write(output + "\n")
     sys.stdout.flush()
@@ -416,13 +428,14 @@ Examples:
             record = PingRecord(time.monotonic(), rtt)
             for _, w in windows:
                 w.append(record)
+            lifetime_window.append(record)
 
             # ── Erase previous frame ──
             for _ in range(num_lines):
                 sys.stdout.write(C.UP + C.CLEAR)
 
             # ── Render new frame ──
-            output   = render_display(windows, target_label, resolved_ip, seq, last_rtt, total_sent, total_rcvd)
+            output   = render_display(windows, target_label, resolved_ip, seq, last_rtt, total_sent, total_rcvd, lifetime_window)
             num_lines = output.count("\n") + 1
             sys.stdout.write(output + "\n")
             sys.stdout.flush()
