@@ -85,7 +85,46 @@ def _build_echo_request(seq: int) -> bytes:
     return header + payload
 
 
-def ping_once(target_ip: str, seq: int, timeout: float) -> float | None:
+def _bind_interface(sock: socket.socket, interface: str):
+    """Bind a socket to a specific network interface name or source IP."""
+    is_ip = False
+    try:
+        socket.inet_aton(interface)
+        if interface.count('.') == 3:
+            is_ip = True
+    except OSError:
+        is_ip = False
+
+    if is_ip:
+        sock.bind((interface, 0))
+    else:
+        opt = getattr(socket, 'SO_BINDTODEVICE', 25)
+        sock.setsockopt(socket.SOL_SOCKET, opt, interface.encode('utf-8'))
+
+
+def validate_interface(interface: str):
+    """Verify that the interface name or IP can be bound to a socket."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
+    except OSError:
+        # Handled in ping_once
+        return
+
+    try:
+        _bind_interface(sock, interface)
+    except PermissionError as e:
+        print(f"\n{C.BRED}Error:{C.RESET} Binding to interface '{interface}' requires elevated privileges: {e}")
+        print(f"  Try running with sudo:")
+        print(f"    {C.BOLD}sudo python ltping.py ...{C.RESET}")
+        sys.exit(1)
+    except OSError as e:
+        print(f"\n{C.BRED}Error:{C.RESET} Cannot bind to interface '{interface}': {e}")
+        sys.exit(1)
+    finally:
+        sock.close()
+
+
+def ping_once(target_ip: str, seq: int, timeout: float, interface: str | None = None) -> float | None:
     """
     Send one ICMP echo request via an unprivileged ping socket and wait for
     the reply.  Returns the round-trip time in milliseconds, or None on
@@ -106,6 +145,14 @@ def ping_once(target_ip: str, seq: int, timeout: float) -> float | None:
         sys.exit(1)
 
     sock.settimeout(timeout)
+
+    if interface:
+        try:
+            _bind_interface(sock, interface)
+        except OSError:
+            sock.close()
+            return None
+
     sent_at = time.monotonic()
     try:
         sock.sendto(packet, (target_ip, 0))
@@ -251,16 +298,19 @@ def render_display(windows: list[tuple[int, StatsWindow]],
                    last_rtt: float | None,
                    total_sent: int,
                    total_rcvd: int,
-                   lifetime_window: StatsWindow | None = None) -> str:
+                   lifetime_window: StatsWindow | None = None,
+                   interface: str | None = None) -> str:
     """Build the full display string to be written to the terminal."""
     now = time.monotonic()
     lines = []
 
     # ── Header ──
     rtt_str   = f"{C.BGREEN}{_fmt_ms(last_rtt)} ms{C.RESET}" if last_rtt else f"{C.BRED}timeout{C.RESET}"
+    iface_str = f"  iface={C.BOLD}{C.BCYAN}{interface}{C.RESET}" if interface else ""
     header    = (f"{C.BOLD}{C.BWHITE}ltping{C.RESET}  "
                  f"{C.DIM}{C.WHITE}{target}{C.RESET}"
                  f"  ({C.DIM}{C.CYAN}{resolved_ip}{C.RESET}{C.DIM}){C.RESET}"
+                 f"{iface_str}"
                  f"  seq={C.BOLD}{seq}{C.RESET}"
                  f"  last={rtt_str}")
     lines.append(header)
@@ -345,6 +395,7 @@ def main():
         epilog="""
 Examples:
   ltping google.com                         # default 10s / 30s / 60s windows
+  ltping 8.8.8.8 -I eth0                   # ping via specific network interface
   ltping 8.8.8.8 -w 5s 15s 60s 5m          # custom windows
   ltping example.com -i 0.5                 # ping every 500 ms
   ltping example.com -w 10s 1m 5m 30m 1h   # long-running monitor
@@ -358,6 +409,8 @@ Examples:
                         help="Seconds between pings. Default: 1.0")
     parser.add_argument("-t", "--timeout", type=float, default=2.0,
                         help="Seconds to wait for each reply. Default: 2.0")
+    parser.add_argument("-I", "--interface",
+                        help="Source network interface name or IP address to ping from.")
     parser.add_argument("--no-color", action="store_true",
                         help="Disable coloured output.")
 
@@ -371,6 +424,10 @@ Examples:
     if args.interval <= 0:
         print(f"{C.BRED}Error:{C.RESET} Interval must be > 0.")
         sys.exit(1)
+
+    # Validate interface if provided
+    if args.interface:
+        validate_interface(args.interface)
 
     # Parse & sort windows
     window_secs = sorted(set(parse_window_spec(w) for w in args.windows))
@@ -407,7 +464,7 @@ Examples:
     num_lines   = 0  # lines written last frame (for cursor-up erasure)
 
     # Print initial frame immediately
-    output = render_display(windows, target_label, resolved_ip, seq, None, 0, 0, lifetime_window)
+    output = render_display(windows, target_label, resolved_ip, seq, None, 0, 0, lifetime_window, args.interface)
     num_lines = output.count("\n") + 1
     sys.stdout.write(output + "\n")
     sys.stdout.flush()
@@ -418,7 +475,7 @@ Examples:
 
             # ── Ping ──
             seq += 1
-            rtt = ping_once(resolved_ip, seq, args.timeout)
+            rtt = ping_once(resolved_ip, seq, args.timeout, args.interface)
             total_sent += 1
             if rtt is not None:
                 total_rcvd += 1
@@ -435,7 +492,7 @@ Examples:
                 sys.stdout.write(C.UP + C.CLEAR)
 
             # ── Render new frame ──
-            output   = render_display(windows, target_label, resolved_ip, seq, last_rtt, total_sent, total_rcvd, lifetime_window)
+            output   = render_display(windows, target_label, resolved_ip, seq, last_rtt, total_sent, total_rcvd, lifetime_window, args.interface)
             num_lines = output.count("\n") + 1
             sys.stdout.write(output + "\n")
             sys.stdout.flush()
@@ -460,6 +517,8 @@ Examples:
         print()
         print(f"{C.BOLD}{C.BWHITE}─── Summary ───{C.RESET}")
         print(f"  Target : {target_label} ({resolved_ip})")
+        if args.interface:
+            print(f"  Iface  : {args.interface}")
         print(f"  Sent   : {total_sent}")
         print(f"  Rcvd   : {total_rcvd}")
         if total_sent:

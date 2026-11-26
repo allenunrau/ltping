@@ -2,12 +2,13 @@
 
 A beautiful, real-time CLI tool for monitoring network latency over configurable time windows. Track ping statistics with live updates, color-coded metrics, and sliding window analytics.
 
-![ltping demo](https://via.placeholder.com/800x400/1a1a1a/00ff00?text=ltping+demo+screenshot)
+![ltping demo](assets/demo.png)
 
 ## Features
 
 - **📊 Sliding Window Statistics** — Track metrics across multiple configurable time periods (10s, 1m, 5m, 1h, etc.)
 - **⏱️ Lifetime Analytics** — Cumulative session metrics (Sent, Rcvd, Loss, Min/Max/Avg RTT, Jitter) right in the table
+- **🌐 Network Interface Selection** — Specify the outgoing network interface name or source IP with `-I` / `--interface`
 - **🎨 Live Color-Coded Display** — Green for healthy, yellow for moderate, red for critical latency/loss
 - **⚡ Real-Time Updates** — In-place refresh shows evolving stats as old pings age out of each window
 - **🔒 No Root Required** — Uses unprivileged ICMP sockets (works on most modern Linux systems)
@@ -61,6 +62,12 @@ python3 ltping.py google.com
 # Ping an IP address
 python3 ltping.py 8.8.8.8
 
+# Ping via a specific network interface
+python3 ltping.py 8.8.8.8 -I eth0
+
+# Ping from a specific source IP address
+python3 ltping.py 8.8.8.8 -I 192.168.1.10
+
 # Custom time windows
 python3 ltping.py example.com -w 5s 15s 60s 5m
 
@@ -74,7 +81,9 @@ python3 ltping.py example.com -w 10s 1m 5m 30m 1h
 ### Command-Line Options
 
 ```
-ltping [-h] [-w WINDOWS [WINDOWS ...]] [-i INTERVAL] [-t TIMEOUT] [--no-color] target
+ltping [-h] [-w WINDOWS [WINDOWS ...]] [-i INTERVAL] [-t TIMEOUT]
+              [-I INTERFACE] [--no-color]
+              target
 
 Positional arguments:
   target                Hostname or IP address to ping
@@ -85,6 +94,7 @@ Options:
                         Default: 10s 30s 60s
   -i, --interval        Seconds between pings (default: 1.0)
   -t, --timeout         Seconds to wait for each reply (default: 2.0)
+  -I, --interface       Source network interface name or IP address to ping from
   --no-color            Disable colored output
 ```
 
@@ -172,6 +182,18 @@ Compare latency before and after VPN connection:
 
 ```bash
 python3 ltping.py cloudflare.com -w 30s 2m 5m
+```
+
+### Multi-Interface & Route Testing
+
+Monitor connectivity and latency specifically through a designated network adapter, backup connection, or VPN interface:
+
+```bash
+# Ping through primary network interface
+python3 ltping.py 8.8.8.8 -I eth0
+
+# Ping through VPN or secondary interface
+python3 ltping.py 8.8.8.8 -I tun0
 ```
 
 ## How It Works
