@@ -7,6 +7,8 @@ over user-configurable time windows.
 
 import argparse
 import collections
+import ctypes
+import os
 import signal
 import socket
 import struct
@@ -49,7 +51,328 @@ class C:
                 setattr(cls, attr, "")
 
 
-# ─── ICMP ping implementation ────────────────────────────────────────────────
+# ─── Windows ICMP (iphlpapi.dll) Support ─────────────────────────────────────
+# On Windows, socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP) fails with WinError 10043,
+# and SOCK_RAW requires Administrator privileges.
+# Windows provides the IP Helper API (iphlpapi.dll) which supports ICMP echo
+# without requiring administrative elevation.
+
+class IP_OPTION_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("Ttl", ctypes.c_ubyte),
+        ("Tos", ctypes.c_ubyte),
+        ("Flags", ctypes.c_ubyte),
+        ("OptionsSize", ctypes.c_ubyte),
+        ("OptionsData", ctypes.c_void_p),
+    ]
+
+
+class ICMP_ECHO_REPLY(ctypes.Structure):
+    _fields_ = [
+        ("Address", ctypes.c_uint32),
+        ("Status", ctypes.c_uint32),
+        ("RoundTripTime", ctypes.c_uint32),
+        ("DataSize", ctypes.c_uint16),
+        ("Reserved", ctypes.c_uint16),
+        ("Data", ctypes.c_void_p),
+        ("Options", IP_OPTION_INFORMATION),
+    ]
+
+
+class SOCKET_ADDRESS(ctypes.Structure):
+    _fields_ = [
+        ("lpSockaddr", ctypes.c_void_p),
+        ("iSockaddrLength", ctypes.c_int),
+    ]
+
+
+class IP_ADAPTER_UNICAST_ADDRESS(ctypes.Structure):
+    pass
+
+IP_ADAPTER_UNICAST_ADDRESS._fields_ = [
+    ("Length", ctypes.c_ulong),
+    ("Flags", ctypes.c_ulong),
+    ("Next", ctypes.POINTER(IP_ADAPTER_UNICAST_ADDRESS)),
+    ("Address", SOCKET_ADDRESS),
+]
+
+
+class IP_ADAPTER_ADDRESSES(ctypes.Structure):
+    pass
+
+IP_ADAPTER_ADDRESSES._fields_ = [
+    ("Length", ctypes.c_ulong),
+    ("IfIndex", ctypes.c_ulong),
+    ("Next", ctypes.POINTER(IP_ADAPTER_ADDRESSES)),
+    ("AdapterName", ctypes.c_char_p),
+    ("FirstUnicastAddress", ctypes.POINTER(IP_ADAPTER_UNICAST_ADDRESS)),
+    ("FirstAnycastAddress", ctypes.c_void_p),
+    ("FirstMulticastAddress", ctypes.c_void_p),
+    ("FirstDnsServerAddress", ctypes.c_void_p),
+    ("DnsSuffix", ctypes.c_wchar_p),
+    ("Description", ctypes.c_wchar_p),
+    ("FriendlyName", ctypes.c_wchar_p),
+]
+
+
+class SOCKADDR_IN(ctypes.Structure):
+    _fields_ = [
+        ("sin_family", ctypes.c_short),
+        ("sin_port", ctypes.c_ushort),
+        ("sin_addr", ctypes.c_ubyte * 4),
+        ("sin_zero", ctypes.c_char * 8),
+    ]
+
+
+def _init_windows_console():
+    """Enable virtual terminal (ANSI) processing on Windows console."""
+    if sys.platform != "win32":
+        return
+    try:
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        STD_OUTPUT_HANDLE = -11
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        h_out = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        if h_out and h_out != wintypes.HANDLE(-1).value and h_out != -1:
+            mode = wintypes.DWORD()
+            if kernel32.GetConsoleMode(h_out, ctypes.byref(mode)):
+                mode.value |= ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                kernel32.SetConsoleMode(h_out, mode)
+    except Exception:
+        pass
+    try:
+        os.system("")
+    except Exception:
+        pass
+
+
+def _get_windows_adapters() -> dict[str, str]:
+    """Return a mapping of {adapter_name: ip_address} for Windows network adapters."""
+    adapters: dict[str, str] = {}
+    if sys.platform != "win32":
+        return adapters
+
+    try:
+        from ctypes import wintypes
+        iphlpapi = ctypes.windll.iphlpapi
+        AF_INET = 2
+        flags = 0x0002 | 0x0004 | 0x0008  # skip anycast, multicast, dns server
+
+        buflen = wintypes.ULONG(16384)
+        buf = ctypes.create_string_buffer(buflen.value)
+
+        ret = iphlpapi.GetAdaptersAddresses(
+            AF_INET, flags, None, ctypes.byref(buf), ctypes.byref(buflen)
+        )
+        if ret == 111:  # ERROR_BUFFER_OVERFLOW
+            buf = ctypes.create_string_buffer(buflen.value)
+            ret = iphlpapi.GetAdaptersAddresses(
+                AF_INET, flags, None, ctypes.byref(buf), ctypes.byref(buflen)
+            )
+
+        if ret == 0:
+            curr = ctypes.cast(buf, ctypes.POINTER(IP_ADAPTER_ADDRESSES))
+            while curr:
+                elem = curr.contents
+                name = elem.FriendlyName
+                desc = elem.Description
+                unicast = elem.FirstUnicastAddress
+                while unicast:
+                    u_elem = unicast.contents
+                    if u_elem.Address.lpSockaddr:
+                        sockaddr = ctypes.cast(u_elem.Address.lpSockaddr, ctypes.POINTER(SOCKADDR_IN)).contents
+                        if sockaddr.sin_family == AF_INET:
+                            ip_str = socket.inet_ntoa(bytes(sockaddr.sin_addr))
+                            if name:
+                                adapters[name] = ip_str
+                            if desc and desc not in adapters:
+                                adapters[desc] = ip_str
+                            break
+                    unicast = u_elem.Next
+                curr = elem.Next
+    except Exception:
+        pass
+
+    if not adapters:
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-NetIPAddress -AddressFamily IPv4 | Select-Object -Property InterfaceAlias,IPAddress | ConvertTo-Csv -NoTypeInformation"],
+                text=True, stderr=subprocess.DEVNULL, timeout=2
+            )
+            for line in out.strip().splitlines()[1:]:
+                parts = [p.strip(' "\'') for p in line.split(",")]
+                if len(parts) >= 2 and parts[1]:
+                    adapters[parts[0]] = parts[1]
+        except Exception:
+            pass
+
+    return adapters
+
+
+def resolve_windows_interface(interface: str) -> str:
+    """Resolve an interface name or IP string to a valid local IPv4 address on Windows."""
+    # 1. Is it already an IPv4 address?
+    try:
+        socket.inet_aton(interface)
+        if interface.count(".") == 3:
+            test_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                test_sock.bind((interface, 0))
+            except OSError as e:
+                print(f"\n{C.BRED}Error:{C.RESET} Cannot bind to IP address '{interface}': {e}")
+                sys.exit(1)
+            finally:
+                test_sock.close()
+            return interface
+    except OSError:
+        pass
+
+    # 2. Look up in adapters
+    adapters = _get_windows_adapters()
+    for name, ip in adapters.items():
+        if name.lower() == interface.lower():
+            return ip
+
+    # 3. Not found
+    print(f"\n{C.BRED}Error:{C.RESET} Network interface '{interface}' not found on this system.")
+    if adapters:
+        print("  Available interfaces:")
+        for name, ip in adapters.items():
+            print(f"    • {C.BOLD}{name}{C.RESET} ({ip})")
+    sys.exit(1)
+
+
+class WindowsPinger:
+    """ICMP Echo implementation for Windows using iphlpapi.dll."""
+    def __init__(self, interface: str | None = None):
+        self.handle = None
+        self.source_ip = None
+        self.source_ip_ulong = 0
+
+        if interface:
+            self.source_ip = resolve_windows_interface(interface)
+            self.source_ip_ulong = struct.unpack("<I", socket.inet_aton(self.source_ip))[0]
+
+        from ctypes import wintypes
+        self.iphlpapi = ctypes.windll.iphlpapi
+        self.kernel32 = ctypes.windll.kernel32
+
+        self.icmp_create_file = self.iphlpapi.IcmpCreateFile
+        self.icmp_create_file.restype = wintypes.HANDLE
+        self.icmp_create_file.argtypes = []
+
+        self.icmp_close_handle = self.iphlpapi.IcmpCloseHandle
+        self.icmp_close_handle.restype = wintypes.BOOL
+        self.icmp_close_handle.argtypes = [wintypes.HANDLE]
+
+        self.icmp_send_echo = self.iphlpapi.IcmpSendEcho
+        self.icmp_send_echo.restype = wintypes.DWORD
+        self.icmp_send_echo.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint16,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+        ]
+
+        self.icmp_send_echo2ex = getattr(self.iphlpapi, "IcmpSendEcho2Ex", None)
+        if self.icmp_send_echo2ex:
+            self.icmp_send_echo2ex.restype = wintypes.DWORD
+            self.icmp_send_echo2ex.argtypes = [
+                wintypes.HANDLE,
+                wintypes.HANDLE,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_uint16,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+            ]
+
+        self.handle = self.icmp_create_file()
+        if not self.handle or self.handle == -1 or self.handle == wintypes.HANDLE(-1).value:
+            self.handle = None
+            err = self.kernel32.GetLastError()
+            raise OSError(f"IcmpCreateFile failed with error code {err}")
+
+    def close(self):
+        if self.handle:
+            try:
+                self.icmp_close_handle(self.handle)
+            except Exception:
+                pass
+            self.handle = None
+
+    def __del__(self):
+        self.close()
+
+    def ping(self, target_ip: str, timeout: float) -> float | None:
+        if not self.handle:
+            return None
+
+        dest_addr = struct.unpack("<I", socket.inet_aton(target_ip))[0]
+        timeout_ms = max(1, int(timeout * 1000))
+
+        payload = b"ltping_echo_data_32_bytes_pad!!"
+        req_size = len(payload)
+        req_buf = ctypes.create_string_buffer(payload)
+
+        reply_size = ctypes.sizeof(ICMP_ECHO_REPLY) + req_size + 64
+        reply_buf = ctypes.create_string_buffer(reply_size)
+
+        sent_at = time.monotonic()
+        try:
+            if self.source_ip_ulong and self.icmp_send_echo2ex:
+                ret = self.icmp_send_echo2ex(
+                    self.handle,
+                    None,
+                    None,
+                    None,
+                    self.source_ip_ulong,
+                    dest_addr,
+                    req_buf,
+                    req_size,
+                    None,
+                    reply_buf,
+                    reply_size,
+                    timeout_ms,
+                )
+            else:
+                ret = self.icmp_send_echo(
+                    self.handle,
+                    dest_addr,
+                    req_buf,
+                    req_size,
+                    None,
+                    reply_buf,
+                    reply_size,
+                    timeout_ms,
+                )
+            recv_at = time.monotonic()
+        except Exception:
+            return None
+
+        if ret == 0:
+            return None
+
+        reply = ICMP_ECHO_REPLY.from_buffer(reply_buf)
+        if reply.Status != 0:
+            return None
+
+        return (recv_at - sent_at) * 1000.0
+
+
+# ─── ICMP ping implementation (Linux / Unix) ──────────────────────────────────
 #
 # Uses SOCK_DGRAM + IPPROTO_ICMP — the "ping socket" ABI exposed by Linux.
 # No root required.  The kernel:
@@ -104,6 +427,10 @@ def _bind_interface(sock: socket.socket, interface: str):
 
 def validate_interface(interface: str):
     """Verify that the interface name or IP can be bound to a socket."""
+    if sys.platform == "win32":
+        resolve_windows_interface(interface)
+        return
+
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
     except OSError:
@@ -124,12 +451,23 @@ def validate_interface(interface: str):
         sock.close()
 
 
-def ping_once(target_ip: str, seq: int, timeout: float, interface: str | None = None) -> float | None:
+def ping_once(target_ip: str, seq: int, timeout: float, interface: str | None = None, pinger: WindowsPinger | None = None) -> float | None:
     """
-    Send one ICMP echo request via an unprivileged ping socket and wait for
-    the reply.  Returns the round-trip time in milliseconds, or None on
-    timeout / error.
+    Send one ICMP echo request and wait for the reply.
+    Returns the round-trip time in milliseconds, or None on timeout / error.
     """
+    if sys.platform == "win32":
+        if pinger is not None:
+            return pinger.ping(target_ip, timeout)
+        try:
+            temp_pinger = WindowsPinger(interface)
+            try:
+                return temp_pinger.ping(target_ip, timeout)
+            finally:
+                temp_pinger.close()
+        except Exception:
+            return None
+
     packet = _build_echo_request(seq)
 
     try:
@@ -420,6 +758,10 @@ Examples:
     if args.no_color or not sys.stdout.isatty():
         C.disable()
 
+    # Enable ANSI escape processing on Windows console
+    if sys.platform == "win32":
+        _init_windows_console()
+
     # Validate interval
     if args.interval <= 0:
         print(f"{C.BRED}Error:{C.RESET} Interval must be > 0.")
@@ -438,6 +780,15 @@ Examples:
     # Resolve target
     resolved_ip = resolve_target(args.target)
     target_label = args.target if args.target != resolved_ip else resolved_ip
+
+    # Initialize Windows pinger if on Windows
+    win_pinger = None
+    if sys.platform == "win32":
+        try:
+            win_pinger = WindowsPinger(args.interface)
+        except OSError as e:
+            print(f"\n{C.BRED}Error:{C.RESET} Cannot initialize Windows ICMP service: {e}")
+            sys.exit(1)
 
     # Build StatsWindow objects
     windows: list[tuple[int, StatsWindow]] = [(s, StatsWindow(s)) for s in window_secs]
@@ -475,7 +826,7 @@ Examples:
 
             # ── Ping ──
             seq += 1
-            rtt = ping_once(resolved_ip, seq, args.timeout, args.interface)
+            rtt = ping_once(resolved_ip, seq, args.timeout, args.interface, pinger=win_pinger)
             total_sent += 1
             if rtt is not None:
                 total_rcvd += 1
@@ -506,9 +857,11 @@ Examples:
                 while running and time.monotonic() < deadline:
                     time.sleep(min(0.05, deadline - time.monotonic()))
 
-    except Exception as e:
+    except (Exception, KeyboardInterrupt):
         pass  # clean exit on any unexpected error during shutdown
     finally:
+        if win_pinger:
+            win_pinger.close()
         # Show cursor
         sys.stdout.write(C.SHOW)
         sys.stdout.flush()

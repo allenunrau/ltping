@@ -11,7 +11,7 @@ A beautiful, real-time CLI tool for monitoring network latency over configurable
 - **🌐 Network Interface Selection** — Specify the outgoing network interface name or source IP with `-I` / `--interface`
 - **🎨 Live Color-Coded Display** — Green for healthy, yellow for moderate, red for critical latency/loss
 - **⚡ Real-Time Updates** — In-place refresh shows evolving stats as old pings age out of each window
-- **🔒 No Root Required** — Uses unprivileged ICMP sockets (works on most modern Linux systems)
+- **🔒 No Root / Administrator Required** — Uses unprivileged ICMP sockets on Linux and native IP Helper API (`iphlpapi.dll`) on Windows 10/11
 - **📈 Comprehensive Metrics** — Min/Max/Avg RTT, packet loss percentage, and network jitter
 - **⌨️ Simple & Intuitive** — Clean interface, sensible defaults, easy to customize
 
@@ -34,10 +34,12 @@ python3 ltping.py google.com
 ### Requirements
 
 - Python 3.10 or newer
-- Linux with kernel support for unprivileged ICMP sockets
+- Linux (kernel 2.6.39+) or Windows 10 / 11
+- Standard user permissions (no root or Administrator elevation required)
 
 ### System Setup
 
+**Linux:**
 Most modern Linux distributions allow unprivileged ping sockets by default. If you see a "ping_group_range" error on first run, fix it with:
 
 ```bash
@@ -50,6 +52,9 @@ To make this permanent across reboots:
 echo 'net.ipv4.ping_group_range = 0 2147483647' | sudo tee -a /etc/sysctl.conf
 sudo sysctl -p
 ```
+
+**Windows:**
+Zero setup required! Windows uses the native Win32 IP Helper API (`iphlpapi.dll`), which works out-of-the-box for standard unprivileged users in Command Prompt, PowerShell, and Windows Terminal.
 
 ## Usage
 
@@ -202,7 +207,7 @@ python3 ltping.py 8.8.8.8 -I tun0
 
 **Lifetime Metrics:** A session-wide tracker records all pings, displaying cumulative sent/received counts, loss percentage, min/max/average latency, and jitter directly in the bottom row of the table.
 
-**Unprivileged ICMP:** Uses `SOCK_DGRAM` with `IPPROTO_ICMP` — the Linux kernel's ping socket API. No raw sockets required, so no root privileges needed on most systems.
+**Unprivileged ICMP:** On Linux, uses `SOCK_DGRAM` with `IPPROTO_ICMP` (the kernel's unprivileged ping socket API). On Windows, uses the native Win32 IP Helper API (`iphlpapi.dll` with `IcmpSendEcho` / `IcmpSendEcho2Ex`). Neither platform requires root or Administrator privileges.
 
 **Jitter Calculation:** Computed as the average of absolute differences between consecutive RTTs within each window. This helps identify network instability beyond simple packet loss.
 
@@ -239,13 +244,13 @@ By default, ltping pings once per second. If you've set a very short interval (e
 - **Language:** Python 3.10+
 - **Dependencies:** Standard library only (no pip packages required)
 - **Protocol:** ICMP Echo Request/Reply (RFC 792)
-- **Socket Type:** `AF_INET`, `SOCK_DGRAM`, `IPPROTO_ICMP`
-- **Platform:** Linux (kernel 2.6.39+)
+- **Protocols & APIs:** Linux unprivileged ICMP sockets (`AF_INET`, `SOCK_DGRAM`, `IPPROTO_ICMP`) / Windows IP Helper API (`iphlpapi.dll`)
+- **Platform:** Linux (kernel 2.6.39+) and Windows (10 / 11)
 
 ## Limitations
 
 - **IPv4 only** — IPv6 support is not currently implemented
-- **Linux only** — Uses Linux-specific ping socket API (won't work on macOS/Windows without modification)
+- **Platform support** — Linux and Windows 10/11 are supported natively without elevation (macOS is not currently supported without root)
 - **Single target** — Monitors one host at a time (run multiple instances for parallel monitoring)
 
 ## Contributing
