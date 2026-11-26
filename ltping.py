@@ -212,6 +212,87 @@ def _get_windows_adapters() -> dict[str, str]:
     return adapters
 
 
+def _get_linux_interfaces() -> list[tuple[str, str | None]]:
+    """Return a list of (interface_name, ipv4_address) for Linux/Unix systems."""
+    interfaces: list[str] = []
+    seen: set[str] = set()
+
+    # 1. socket.if_nameindex()
+    if hasattr(socket, "if_nameindex"):
+        try:
+            for _, name in socket.if_nameindex():
+                if name not in seen:
+                    seen.add(name)
+                    interfaces.append(name)
+        except OSError:
+            pass
+
+    # 2. /sys/class/net
+    if os.path.exists("/sys/class/net"):
+        try:
+            for name in sorted(os.listdir("/sys/class/net")):
+                if name not in seen:
+                    seen.add(name)
+                    interfaces.append(name)
+        except OSError:
+            pass
+
+    # Retrieve IPv4 address for each interface via SIOCGIFADDR ioctl
+    result: list[tuple[str, str | None]] = []
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError:
+        pass
+
+    try:
+        import fcntl
+        for ifname in interfaces:
+            ip = None
+            if sock:
+                try:
+                    ip = socket.inet_ntoa(fcntl.ioctl(
+                        sock.fileno(),
+                        0x8915,  # SIOCGIFADDR
+                        struct.pack("256s", ifname[:15].encode("utf-8"))
+                    )[20:24])
+                except Exception:
+                    ip = None
+            result.append((ifname, ip))
+    except ImportError:
+        for ifname in interfaces:
+            result.append((ifname, None))
+    finally:
+        if sock:
+            sock.close()
+
+    return result
+
+
+def get_available_interfaces() -> list[tuple[str, str | None]]:
+    """Return a list of (interface_name, ipv4_address) for the current system."""
+    if sys.platform == "win32":
+        adapters = _get_windows_adapters()
+        res = [(name, ip) for name, ip in adapters.items()]
+        if not any(ip == "127.0.0.1" for _, ip in res):
+            res.append(("Loopback", "127.0.0.1"))
+        return res
+    else:
+        return _get_linux_interfaces()
+
+
+def print_available_interfaces():
+    """Print a formatted list of available network interfaces."""
+    ifaces = get_available_interfaces()
+    if ifaces:
+        print(f"\n{C.BOLD}{C.BWHITE}Available network interfaces:{C.RESET}")
+        for name, ip in ifaces:
+            ip_str = f" ({C.BCYAN}{ip}{C.RESET})" if ip else f" {C.DIM}(no IPv4 address){C.RESET}"
+            print(f"  • {C.BOLD}{name}{C.RESET}{ip_str}")
+    else:
+        print(f"\n{C.YELLOW}No network interfaces detected.{C.RESET}")
+
+
 def resolve_windows_interface(interface: str) -> str:
     """Resolve an interface name or IP string to a valid local IPv4 address on Windows."""
     # 1. Is it already an IPv4 address?
@@ -223,6 +304,7 @@ def resolve_windows_interface(interface: str) -> str:
                 test_sock.bind((interface, 0))
             except OSError as e:
                 print(f"\n{C.BRED}Error:{C.RESET} Cannot bind to IP address '{interface}': {e}")
+                print_available_interfaces()
                 sys.exit(1)
             finally:
                 test_sock.close()
@@ -238,10 +320,7 @@ def resolve_windows_interface(interface: str) -> str:
 
     # 3. Not found
     print(f"\n{C.BRED}Error:{C.RESET} Network interface '{interface}' not found on this system.")
-    if adapters:
-        print("  Available interfaces:")
-        for name, ip in adapters.items():
-            print(f"    • {C.BOLD}{name}{C.RESET} ({ip})")
+    print_available_interfaces()
     sys.exit(1)
 
 
@@ -427,15 +506,43 @@ def _bind_interface(sock: socket.socket, interface: str):
 
 def validate_interface(interface: str):
     """Verify that the interface name or IP can be bound to a socket."""
+    if not interface or not interface.strip():
+        print(f"\n{C.BRED}Error:{C.RESET} Missing interface name for -I / --interface.")
+        print_available_interfaces()
+        sys.exit(1)
+
+    interface = interface.strip()
+
     if sys.platform == "win32":
         resolve_windows_interface(interface)
         return
 
+    # Check if interface is an IPv4 address
+    is_ip = False
+    try:
+        socket.inet_aton(interface)
+        if interface.count('.') == 3:
+            is_ip = True
+    except OSError:
+        is_ip = False
+
+    if not is_ip:
+        # Check if interface exists in system interfaces
+        available = [name for name, _ in get_available_interfaces()]
+        if available and interface not in available:
+            print(f"\n{C.BRED}Error:{C.RESET} Network interface '{interface}' does not exist.")
+            print_available_interfaces()
+            sys.exit(1)
+
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
     except OSError:
-        # Handled in ping_once
-        return
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        except OSError as e:
+            print(f"\n{C.BRED}Error:{C.RESET} Cannot create socket to test interface '{interface}': {e}")
+            print_available_interfaces()
+            sys.exit(1)
 
     try:
         _bind_interface(sock, interface)
@@ -443,9 +550,15 @@ def validate_interface(interface: str):
         print(f"\n{C.BRED}Error:{C.RESET} Binding to interface '{interface}' requires elevated privileges: {e}")
         print(f"  Try running with sudo:")
         print(f"    {C.BOLD}sudo python ltping.py ...{C.RESET}")
+        print_available_interfaces()
         sys.exit(1)
     except OSError as e:
         print(f"\n{C.BRED}Error:{C.RESET} Cannot bind to interface '{interface}': {e}")
+        print_available_interfaces()
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n{C.BRED}Error:{C.RESET} Error selecting interface '{interface}': {e}")
+        print_available_interfaces()
         sys.exit(1)
     finally:
         sock.close()
@@ -725,8 +838,35 @@ def parse_window_spec(spec: str) -> int:
     return int(spec)
 
 
+class CustomArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        if "-I" in message or "--interface" in message:
+            print(f"\n{C.BRED}Error:{C.RESET} {message}")
+            print_available_interfaces()
+            sys.exit(1)
+        super().error(message)
+
+
 def main():
-    parser = argparse.ArgumentParser(
+    # Pre-parse check for --no-color early so error messages respect it
+    if "--no-color" in sys.argv or not sys.stdout.isatty():
+        C.disable()
+
+    # Check if -I or --interface was specified with a missing value
+    for idx, arg in enumerate(sys.argv[1:], 1):
+        if arg in ("-I", "--interface"):
+            if idx == len(sys.argv) - 1 or sys.argv[idx + 1].startswith("-") or not sys.argv[idx + 1].strip():
+                print(f"\n{C.BRED}Error:{C.RESET} Missing interface name for {arg}.")
+                print_available_interfaces()
+                sys.exit(1)
+        elif arg.startswith("--interface="):
+            val = arg.split("=", 1)[1].strip()
+            if not val:
+                print(f"\n{C.BRED}Error:{C.RESET} Missing interface name for --interface.")
+                print_available_interfaces()
+                sys.exit(1)
+
+    parser = CustomArgumentParser(
         prog="ltping",
         description="Long-term ping monitor with rolling statistics windows.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -748,7 +888,8 @@ Examples:
     parser.add_argument("-t", "--timeout", type=float, default=2.0,
                         help="Seconds to wait for each reply. Default: 2.0")
     parser.add_argument("-I", "--interface",
-                        help="Source network interface name or IP address to ping from.")
+                        help="Source network interface name or IP address to ping from "
+                             "(run 'ltping -I' to list available interfaces).")
     parser.add_argument("--no-color", action="store_true",
                         help="Disable coloured output.")
 
@@ -768,7 +909,11 @@ Examples:
         sys.exit(1)
 
     # Validate interface if provided
-    if args.interface:
+    if args.interface is not None:
+        if not args.interface.strip():
+            print(f"\n{C.BRED}Error:{C.RESET} Missing interface name for -I / --interface.")
+            print_available_interfaces()
+            sys.exit(1)
         validate_interface(args.interface)
 
     # Parse & sort windows

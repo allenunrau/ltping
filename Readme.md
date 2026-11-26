@@ -100,6 +100,7 @@ Options:
   -i, --interval        Seconds between pings (default: 1.0)
   -t, --timeout         Seconds to wait for each reply (default: 2.0)
   -I, --interface       Source network interface name or IP address to ping from
+                        (run `ltping -I` to list available interfaces)
   --no-color            Disable colored output
 ```
 
@@ -194,12 +195,21 @@ python3 ltping.py cloudflare.com -w 30s 2m 5m
 Monitor connectivity and latency specifically through a designated network adapter, backup connection, or VPN interface:
 
 ```bash
+# List available network interfaces
+python3 ltping.py -I
+
 # Ping through primary network interface
 python3 ltping.py 8.8.8.8 -I eth0
 
 # Ping through VPN or secondary interface
 python3 ltping.py 8.8.8.8 -I tun0
+
+# Ping using a specific source IP address
+python3 ltping.py 8.8.8.8 -I 192.168.1.10
 ```
+
+> [!TIP]
+> If you omit the interface argument (`ltping -I`) or specify an invalid interface name/IP, `ltping` will automatically display a list of all available network interfaces on your system.
 
 ## How It Works
 
